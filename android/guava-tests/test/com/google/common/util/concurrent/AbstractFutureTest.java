@@ -17,6 +17,7 @@
 package com.google.common.util.concurrent;
 
 import static com.google.common.truth.Truth.assertThat;
+import static com.google.common.truth.Truth.assertWithMessage;
 
 import com.google.common.collect.Iterables;
 import com.google.common.collect.Range;
@@ -228,6 +229,52 @@ public class AbstractFutureTest extends TestCase {
       assertThat(e.getMessage()).contains("1 nanoseconds");
       assertThat(e.getMessage()).contains("Because this test isn't done");
     }
+  }
+
+  /**
+   * This test attempts to cause a future to wait for longer than it was requested to from a timed
+   * get() call. As measurements of time are prone to flakiness, it tries to assert based on ranges
+   * derived from observing how much time actually passed for various operations.
+   */
+  @SuppressWarnings({"DeprecatedThreadMethods", "ThreadPriorityCheck"})
+  public void testToString_delayedTimeout() throws Exception {
+    TimedWaiterThread thread =
+        new TimedWaiterThread(new AbstractFuture<Object>() {}, 2, TimeUnit.SECONDS);
+    thread.start();
+    thread.awaitWaiting();
+    thread.suspend();
+    // Sleep for enough time to add 1500 milliseconds of overwait to the get() call.
+    long toWaitMillis = 3500 - TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - thread.startTime);
+    Thread.sleep(toWaitMillis);
+    thread.setPriority(Thread.MAX_PRIORITY);
+    thread.resume();
+    thread.join();
+    // It's possible to race and suspend the thread just before the park call actually takes effect,
+    // causing the thread to be suspended for 3.5 seconds, and then park itself for 2 seconds after
+    // being resumed. To avoid a flake in this scenario, calculate how long that thread actually
+    // waited and assert based on that time. Empirically, the race where the thread ends up waiting
+    // for 5.5 seconds happens about 2% of the time.
+    boolean longWait = TimeUnit.NANOSECONDS.toSeconds(thread.timeSpentBlocked) >= 5;
+    // Count how long it actually took to return; we'll accept any number between the expected delay
+    // and the approximate actual delay, to be robust to variance in thread scheduling.
+    char overWaitNanosFirstDigit =
+        Long.toString(
+                thread.timeSpentBlocked - TimeUnit.MILLISECONDS.toNanos(longWait ? 5000 : 3000))
+            .charAt(0);
+    if (overWaitNanosFirstDigit < '4') {
+      overWaitNanosFirstDigit = '9';
+    }
+    String nanosRegex = "[4-" + overWaitNanosFirstDigit + "][0-9]+";
+    assertWithMessage(
+            "Spent " + thread.timeSpentBlocked + " ns blocked; slept for " + toWaitMillis + " ms")
+        .that(thread.exception)
+        .hasMessageThat()
+        .matches(
+            "Waited 2 seconds \\(plus "
+                + (longWait ? "3" : "1")
+                + " seconds, "
+                + nanosRegex
+                + " nanoseconds delay\\).*");
   }
 
   public void testToString_completed() throws Exception {
@@ -735,6 +782,84 @@ public class AbstractFutureTest extends TestCase {
     assertTrue(orig.isDone());
   }
 
+  public void testSetFuture_misbehavingFutureThrows() throws Exception {
+    SettableFuture<String> future = SettableFuture.create();
+    ListenableFuture<String> badFuture =
+        new ListenableFuture<String>() {
+          @Override
+          public boolean cancel(boolean interrupt) {
+            return false;
+          }
+
+          @Override
+          public boolean isDone() {
+            return true;
+          }
+
+          @Override
+          public boolean isCancelled() {
+            return false; // BAD!!
+          }
+
+          @Override
+          public String get() {
+            throw new CancellationException(); // BAD!!
+          }
+
+          @Override
+          public String get(long time, TimeUnit unit) {
+            throw new CancellationException(); // BAD!!
+          }
+
+          @Override
+          public void addListener(Runnable runnable, Executor executor) {
+            executor.execute(runnable);
+          }
+        };
+    future.setFuture(badFuture);
+    ExecutionException expected = getExpectingExecutionException(future);
+    assertThat(expected).hasCauseThat().isInstanceOf(IllegalArgumentException.class);
+    assertThat(expected).hasCauseThat().hasMessageThat().contains(badFuture.toString());
+  }
+
+  public void testSetFuture_misbehavingFutureDoesNotThrow() throws Exception {
+    SettableFuture<String> future = SettableFuture.create();
+    ListenableFuture<String> badFuture =
+        new ListenableFuture<String>() {
+          @Override
+          public boolean cancel(boolean interrupt) {
+            return false;
+          }
+
+          @Override
+          public boolean isDone() {
+            return true;
+          }
+
+          @Override
+          public boolean isCancelled() {
+            return true; // BAD!!
+          }
+
+          @Override
+          public String get() {
+            return "foo"; // BAD!!
+          }
+
+          @Override
+          public String get(long time, TimeUnit unit) {
+            return "foo"; // BAD!!
+          }
+
+          @Override
+          public void addListener(Runnable runnable, Executor executor) {
+            executor.execute(runnable);
+          }
+        };
+    future.setFuture(badFuture);
+    assertThat(future.isCancelled()).isTrue();
+  }
+
   public void testCancel_stackOverflow() {
     SettableFuture<String> orig = SettableFuture.create();
     SettableFuture<String> prev = orig;
@@ -850,12 +975,16 @@ public class AbstractFutureTest extends TestCase {
     }
 
     void awaitWaiting() {
-      while (LockSupport.getBlocker(this) != future) {
+      while (!isBlocked()) {
         if (getState() == State.TERMINATED) {
           throw new RuntimeException("Thread exited");
         }
         Thread.yield();
       }
+    }
+
+    private boolean isBlocked() {
+      return getState() == Thread.State.WAITING && LockSupport.getBlocker(this) == future;
     }
   }
 
@@ -863,6 +992,9 @@ public class AbstractFutureTest extends TestCase {
     private final AbstractFuture<?> future;
     private final long timeout;
     private final TimeUnit unit;
+    private Exception exception;
+    private volatile long startTime;
+    private long timeSpentBlocked;
 
     TimedWaiterThread(AbstractFuture<?> future, long timeout, TimeUnit unit) {
       this.future = future;
@@ -872,20 +1004,28 @@ public class AbstractFutureTest extends TestCase {
 
     @Override
     public void run() {
+      startTime = System.nanoTime();
       try {
         future.get(timeout, unit);
       } catch (Exception e) {
         // nothing
+        exception = e;
+      } finally {
+        timeSpentBlocked = System.nanoTime() - startTime;
       }
     }
 
     void awaitWaiting() {
-      while (LockSupport.getBlocker(this) != future) {
+      while (!isBlocked()) {
         if (getState() == State.TERMINATED) {
           throw new RuntimeException("Thread exited");
         }
         Thread.yield();
       }
+    }
+
+    private boolean isBlocked() {
+      return getState() == Thread.State.TIMED_WAITING && LockSupport.getBlocker(this) == future;
     }
   }
 
